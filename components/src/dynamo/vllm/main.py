@@ -150,7 +150,7 @@ async def worker():
     ):
         await init_multimodal_worker(runtime, config, shutdown_event)
         logger.debug("init_multimodal_worker completed")
-    elif config.omni_worker:
+    elif config.omni:
         await init_omni(runtime, config, shutdown_event)
         logger.debug("init_omni completed")
     elif config.is_prefill_worker:
