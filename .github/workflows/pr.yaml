@@ -362,134 +362,56 @@ jobs:
         export KUBECONFIG=$(pwd)/.kubeconfig
         kubectl config set-context --current --namespace=$NAMESPACE --kubeconfig "${KUBECONFIG}"
         kubectl config get-contexts
-    - name: Run Tests
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+        cache-dependency-path: 'container/deps/requirements.test.txt'
+    - name: Install test dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r container/deps/requirements.test.txt
+    - name: Run Pytest Deployment Tests
       id: run-tests
       env:
         NAMESPACE: ${{ needs.deploy-operator.outputs.NAMESPACE }}
+        KUBECONFIG: ${{ github.workspace }}/.kubeconfig
+        FRAMEWORK: ${{ env.FRAMEWORK }}
+        PROFILE: ${{ matrix.profile }}
+        IMAGE: ${{ secrets.AZURE_ACR_HOSTNAME }}/ai-dynamo/dynamo:${{ github.sha }}-${{ env.FRAMEWORK }}-amd64
       run: |
-        set -x
-        export KUBECONFIG=$(pwd)/.kubeconfig
-        kubectl config set-context --current --namespace=$NAMESPACE
-
-        # Redirect all output to a log file while still showing it
-        exec > >(tee -a test-output.log) 2>&1
-
-        cd examples/backends/$FRAMEWORK
-        export FRAMEWORK_RUNTIME_IMAGE="${{ secrets.AZURE_ACR_HOSTNAME }}/ai-dynamo/dynamo:${{ github.sha }}-${FRAMEWORK}-amd64"
-        export KUBE_NS=$NAMESPACE
-        export GRAPH_NAME=$(yq e '.metadata.name' $DEPLOYMENT_FILE)
-        echo "GRAPH_NAME=${GRAPH_NAME}" >> $GITHUB_ENV
-        # Update the deployment file in-place
-        yq -i '.spec.services.[].extraPodSpec.mainContainer.image = env(FRAMEWORK_RUNTIME_IMAGE)' $DEPLOYMENT_FILE
-
-        # Debug: Show updated deployment file
-        echo "=== UPDATED DEPLOYMENT FILE ==="
-        cat $DEPLOYMENT_FILE
-
-        # Apply the updated file
-        kubectl apply -n $KUBE_NS -f $DEPLOYMENT_FILE
-
-        # --- Wait for all pods in the dynamo graph deployment to be ready ---
-        sleep 20
-        # Get the deployment name from the file
-        export GRAPH_NAME=$(yq e '.metadata.name' $DEPLOYMENT_FILE)
-        echo "Waiting for all pods with label nvidia.com/dynamo-graph-deployment-name: $GRAPH_NAME"
-        # Wait for all pods with the deployment label to be ready
-        kubectl wait --for=condition=ready pod -l "nvidia.com/dynamo-graph-deployment-name=$GRAPH_NAME" -n ${KUBE_NS} --timeout=1800s
-
-        # Debug: Show final pod statuses for the deployment
-        echo "=== FINAL POD STATUSES ==="
-        kubectl get pods -l "nvidia.com/dynamo-graph-deployment-name=$GRAPH_NAME" -n $KUBE_NS -o wide
-        echo ""
-
-        kubectl get all -n $KUBE_NS
-        export FRONTEND_POD=$(kubectl get pods -n ${KUBE_NS} -l nvidia.com/dynamo-component-type=frontend,nvidia.com/dynamo-graph-deployment-name=${GRAPH_NAME} | tail -n1 | awk '{print $1}')
-        export CONTAINER_PORT=$(kubectl get pod $FRONTEND_POD -n ${KUBE_NS} -o jsonpath='{.spec.containers[0].ports[?(@.name=="http")].containerPort}')
-        echo "Container port is ${CONTAINER_PORT}"
-        kubectl port-forward pod/$FRONTEND_POD 8000:${CONTAINER_PORT} -n ${KUBE_NS} &
-        export LLM_URL="http://localhost:8000"
-        sleep 10  # Give port-forward time to establish the connection
-        echo "LLM URL: ${LLM_URL}"
-        echo "MODEL NAME: ${MODEL_NAME}"
-        # Wait until the model is available in the /v1/models response
-        MAX_ATTEMPTS=30
-        ATTEMPT=1
-        while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-          MODELS_RESPONSE=$(curl -s --retry 5 --retry-delay 2 --retry-connrefused "${LLM_URL}/v1/models")
-          if echo "$MODELS_RESPONSE" | jq -e --arg MODEL_NAME "$MODEL_NAME" '.data[]?.id == $MODEL_NAME' >/dev/null 2>&1; then
-            echo "Model $MODEL_NAME is available in /v1/models"
-            break
-          fi
-          echo "Waiting for model $MODEL_NAME to be available in /v1/models... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
-          sleep 5
-          ATTEMPT=$((ATTEMPT + 1))
-        done
-        if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
-          echo "Model $MODEL_NAME not found in /v1/models after $MAX_ATTEMPTS attempts"
-          echo "Last response: $MODELS_RESPONSE"
-          exit 1
-        fi
-        RESPONSE=$(curl -s -N --no-buffer --retry 10 --retry-delay 5 --retry-connrefused -X POST "${LLM_URL}/v1/chat/completions" \
-          -H 'accept: text/event-stream' \
-          -H 'Content-Type: application/json' \
-          -d '{
-            "model": "'"${MODEL_NAME:-Qwen/Qwen3-0.6B}"'",
-            "messages": [
-            {
-                "role": "user",
-                "content": "In the heart of Eldoria, an ancient land of boundless magic and mysterious creatures, lies the long-forgotten city of Aeloria. Once a beacon of knowledge and power, Aeloria was buried beneath the shifting sands of time, lost to the world for centuries. You are an intrepid explorer, known for your unparalleled curiosity and courage, who has stumbled upon an ancient map hinting at ests that Aeloria holds a secret so profound that it has the potential to reshape the very fabric of reality. Your journey will take you through treacherous deserts, enchanted forests, and across perilous mountain ranges. Your Task: Character Background: Develop a detailed background for your character. Describe their motivations for seeking out Aeloria, their skills and weaknesses, and any personal connections to the ancient city or its legends. Are they driven by a quest for knowledge, a search for lost familt clue is hidden."
-            }
-            ],
-            "stream":false,
-            "max_tokens": 30,
-            "temperature": 0.0
-          }' 2>&1)
-        echo "Response: $RESPONSE"
-        TEST_RESULT=0
-        if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
-          echo "Test failed: Response is not valid JSON"
-          echo "Got: $RESPONSE"
-          TEST_RESULT=1
-        elif ! echo "$RESPONSE" | jq -e '.choices[0].message.role == "assistant"' >/dev/null 2>&1; then
-          echo "Test failed: Message role is not 'assistant'"
-          echo "Got: $(echo "$RESPONSE" | jq '.choices[0].message.role')"
-          TEST_RESULT=1
-        elif ! echo "$RESPONSE" | jq -e '.model == "'"${MODEL_NAME}"'"' >/dev/null 2>&1; then
-          echo "Test failed: Model name is incorrect"
-          echo "Got: $(echo "$RESPONSE" | jq '.model')"
-          TEST_RESULT=1
-        elif ! echo "$RESPONSE" | jq -e '.choices[0].message.content | length > 100' >/dev/null 2>&1; then
-          echo "Test failed: Response content length is not greater than 100 characters"
-          echo "Got length: $(echo "$RESPONSE" | jq '.choices[0].message.content | length')"
-          TEST_RESULT=1
-        else
-          echo "Test passed: Response matches expected format and content"
-        fi
-        exit $TEST_RESULT
-    - name: Process Deployment Test Results
-      if: always()
-      run: |
-        set -x
-
-        # Create test-results directory
         mkdir -p test-results
-
-        # Copy and rename the test output log with unique naming
-        if [ -f "test-output.log" ]; then
-          cp test-output.log "test-results/deploy_test_output_${{ env.FRAMEWORK }}_${{ matrix.profile }}_amd64_${{ github.run_id }}_${{ job.check_run_id }}.log"
-          echo "✅ Test output log copied to test-results/"
-        else
-          echo "⚠️  test-output.log not found"
-        fi
-
-    - name: Upload Deployment Test Results
+        pytest tests/deploy/test_deploy.py \
+          --framework="${FRAMEWORK}" \
+          --profile="${PROFILE}" \
+          --image="${IMAGE}" \
+          --namespace="${NAMESPACE}" \
+          -v -s \
+          --junitxml=test-results/pytest_deploy_${FRAMEWORK}_${PROFILE}_amd64.xml \
+          --log-cli-level=INFO
+    - name: Generate Test Metadata
+      if: always()
+      env:
+        FRAMEWORK: ${{ env.FRAMEWORK }}
+        PROFILE: ${{ matrix.profile }}
+      run: |
+        cat > test-results/test_metadata_${FRAMEWORK}_deploy_${PROFILE}_amd64.json <<EOF
+        {
+          "framework": "${FRAMEWORK}",
+          "test_type": "deploy",
+          "profile": "${PROFILE}",
+          "step_name": "Run Pytest Deployment Tests",
+          "junit_xml_file": "pytest_deploy_${FRAMEWORK}_${PROFILE}_amd64.xml"
+        }
+        EOF
+    - name: Upload Test Results
       uses: actions/upload-artifact@v4
       if: always()
       with:
         name: test-results-${{ env.FRAMEWORK }}-deploy-${{ matrix.profile }}-amd64-${{ github.run_id }}-${{ job.check_run_id }}
-        path: test-results/deploy_test_output_${{ env.FRAMEWORK }}_${{ matrix.profile }}_amd64_${{ github.run_id }}_${{ job.check_run_id }}.log
+        path: test-results/
         retention-days: 7
-
     - name: Cleanup
       if: always()
       timeout-minutes: 5

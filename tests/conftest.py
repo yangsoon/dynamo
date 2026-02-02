@@ -60,6 +60,7 @@ def pytest_configure(config):
         "custom_build: marks tests that require custom builds or special setup (e.g., MoE models)",
         "k8s: marks tests as requiring Kubernetes",
         "fault_tolerance: marks tests as fault tolerance tests",
+        "deploy: marks tests as deployment tests",
     ]
     for marker in markers:
         config.addinivalue_line("markers", marker)
