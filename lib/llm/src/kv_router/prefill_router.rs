@@ -196,7 +196,7 @@ impl PrefillRouter {
         let inner_router = if self.router_mode.is_kv_routing() {
             // Create KV chooser using the endpoint
             let kv_chooser = model_manager
-                .kv_chooser_for(&endpoint, kv_cache_block_size, kv_router_config)
+                .kv_chooser_for(&endpoint, kv_cache_block_size, kv_router_config, None)
                 .await?;
 
             // Extract client from kv_chooser to ensure shared state
