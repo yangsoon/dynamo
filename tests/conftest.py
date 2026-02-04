@@ -61,6 +61,8 @@ def pytest_configure(config):
         "k8s: marks tests as requiring Kubernetes",
         "fault_tolerance: marks tests as fault tolerance tests",
         "deploy: marks tests as deployment tests",
+        # Third-party plugin markers
+        "timeout: test timeout in seconds (pytest-timeout plugin)",
     ]
     for marker in markers:
         config.addinivalue_line("markers", marker)
