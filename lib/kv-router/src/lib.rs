@@ -7,12 +7,17 @@
 //! efficient KV cache lookup and routing in distributed LLM inference systems.
 
 pub mod approx;
+pub mod concurrent_radix_tree;
 pub mod flat_hashmap;
 pub mod indexer;
 pub mod protocols;
 pub mod radix_tree;
 
+#[cfg(test)]
+pub(crate) mod test_utils;
+
 // Re-export key types for convenience
+pub use concurrent_radix_tree::ConcurrentRadixTree;
 pub use flat_hashmap::FlatHashMap;
 pub use indexer::MaybeError;
 pub use protocols::{

@@ -2295,6 +2295,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap 4.5.53",
+ "dashmap 6.1.0",
  "dynamo-runtime",
  "dynamo-tokens",
  "indicatif 0.18.3",
