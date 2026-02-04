@@ -985,7 +985,7 @@ async fn create_kv_router_from_endpoint(
     // Create ModelManager and use it to create KvRouter (ensures registration)
     let model_manager = Arc::new(llm_rs::discovery::ModelManager::new());
     let kv_router = model_manager
-        .kv_chooser_for(&endpoint.inner, block_size as u32, kv_router_config)
+        .kv_chooser_for(&endpoint.inner, block_size as u32, kv_router_config, None)
         .await
         .map_err(to_pyerr)?;
 
