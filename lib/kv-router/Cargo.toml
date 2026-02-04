@@ -47,3 +47,8 @@ tokio = { workspace = true, features = ["rt", "macros", "time"] }
 name = "radix_tree_microbench"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "concurrent_microbench"
+harness = false
+required-features = ["bench"]
