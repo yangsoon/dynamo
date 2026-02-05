@@ -325,8 +325,8 @@ jobs:
 
   deploy-test-vllm:
     runs-on: prod-default-v1
-    # Run if push to main, or manually triggered
-    if: ( github.ref_name == 'main' || github.event.inputs.run_deploy_operator )
+    # Run if any of the following changed: core, vllm, deploy
+    if: needs.changed-files.outputs.core == 'true' || needs.changed-files.outputs.vllm == 'true' || needs.changed-files.outputs.deploy == 'true'
     needs: [changed-files, deploy-operator, vllm]
     permissions:
       contents: read
@@ -338,7 +338,7 @@ jobs:
           - agg
           - agg_router
           - disagg
-          # - disagg_router
+          - disagg_router
     name: deploy-test-vllm (${{ matrix.profile }})
     env:
       FRAMEWORK: vllm
@@ -388,7 +388,7 @@ jobs:
           --image="${IMAGE}" \
           --namespace="${NAMESPACE}" \
           -v -s \
-          --junitxml=test-results/pytest_deploy_${FRAMEWORK}_${PROFILE}_amd64.xml \
+          --junitxml=test-results/pytest_deploy_${FRAMEWORK}_${PROFILE}_amd64_${{ github.run_id }}_${{ job.check_run_id }}.xml \
           --log-cli-level=INFO
     - name: Generate Test Metadata
       if: always()
@@ -396,13 +396,13 @@ jobs:
         FRAMEWORK: ${{ env.FRAMEWORK }}
         PROFILE: ${{ matrix.profile }}
       run: |
-        cat > test-results/test_metadata_${FRAMEWORK}_deploy_${PROFILE}_amd64.json <<EOF
+        cat > test-results/test_metadata_${FRAMEWORK}_deploy_${PROFILE}_amd64_${{ github.run_id }}_${{ job.check_run_id }}.json <<EOF
         {
           "framework": "${FRAMEWORK}",
           "test_type": "deploy",
           "profile": "${PROFILE}",
           "step_name": "Run Pytest Deployment Tests",
-          "junit_xml_file": "pytest_deploy_${FRAMEWORK}_${PROFILE}_amd64.xml"
+          "junit_xml_file": "pytest_deploy_${FRAMEWORK}_${PROFILE}_amd64_${{ github.run_id }}_${{ job.check_run_id }}.xml"
         }
         EOF
     - name: Upload Test Results
@@ -429,36 +429,10 @@ jobs:
         echo "Deleting DynamoGraphDeployments for this job in namespace $NAMESPACE..."
         kubectl delete dynamographdeployments ${GRAPH_NAME} -n $NAMESPACE || true
 
-  # For now, this job is separated from the job matrix above for easier flow control handling
-  # Uncomment the disagg_router matrix entry from the above job and delete the below job
-  # when we want to run them under the same conditions.
-  # Current conditions:
-  # - Run vllm disagg_router on all commits
-  # - Run rest of jobs only on push to main or manual trigger
-  deploy-test-vllm-disagg-router:
-    runs-on: prod-default-v1
-    if: needs.changed-files.outputs.core == 'true' || needs.changed-files.outputs.vllm == 'true' || needs.changed-files.outputs.deploy == 'true'
-    needs: [changed-files, deploy-operator, vllm]
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        profile:
-          - disagg_router
-    name: deploy-test-vllm (${{ matrix.profile }})
-    env:
-      FRAMEWORK: vllm
-      DYNAMO_INGRESS_SUFFIX: dev.aire.nvidia.com
-      DEPLOYMENT_FILE: "deploy/${{ matrix.profile }}.yaml"
-      MODEL_NAME: "Qwen/Qwen3-0.6B"
-    steps: *deploy-test-steps
-
   deploy-test-sglang:
     runs-on: prod-default-v1
-    # Run if push to main, or manually triggered
-    if: ( github.ref_name == 'main' || github.event.inputs.run_deploy_operator )
+    # Run if any of the following changed: core, sglang, deploy
+    if: needs.changed-files.outputs.core == 'true' || needs.changed-files.outputs.sglang == 'true' || needs.changed-files.outputs.deploy == 'true'
     needs: [changed-files, deploy-operator, sglang]
     permissions:
       contents: read
@@ -479,8 +453,8 @@ jobs:
 
   deploy-test-trtllm:
     runs-on: prod-default-v1
-    # Run if push to main, or manually triggered
-    if: ( github.ref_name == 'main' || github.event.inputs.run_deploy_operator )
+    # Run if any of the following changed: core, trtllm, deploy
+    if: needs.changed-files.outputs.core == 'true' || needs.changed-files.outputs.trtllm == 'true' || needs.changed-files.outputs.deploy == 'true'
     needs: [changed-files, deploy-operator, trtllm]
     permissions:
       contents: read
@@ -504,7 +478,7 @@ jobs:
   cleanup:
     runs-on: prod-default-v1
     if: always()
-    needs: [changed-files, deploy-operator, deploy-test-trtllm, deploy-test-sglang, deploy-test-vllm, deploy-test-vllm-disagg-router]
+    needs: [changed-files, deploy-operator, deploy-test-trtllm, deploy-test-sglang, deploy-test-vllm]
     steps:
     - name: Output Node Name
       shell: bash
