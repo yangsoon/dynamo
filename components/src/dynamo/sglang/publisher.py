@@ -276,6 +276,8 @@ def setup_prometheus_registry(
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
+
+    # Label injection example: inject_labels={"dynamo_namespace": ns, "model": model}
     register_engine_metrics_callback(
         endpoint=generate_endpoint,
         registry=registry,

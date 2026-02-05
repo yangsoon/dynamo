@@ -413,8 +413,8 @@ async def init(
                 )
                 logging.info("TensorRT-LLM MetricsCollector initialized")
 
-                # Register callback to expose TRT-LLM metrics via Dynamo endpoint
-                # Filter out python_/process_ metrics and add trtllm_ prefix to remaining metrics
+                # Register TRT-LLM metrics (filter python_/process_, add trtllm_ prefix)
+                # Label injection example: inject_labels={"dynamo_namespace": ns, "model": model}
                 register_engine_metrics_callback(
                     endpoint=endpoint,
                     registry=REGISTRY,

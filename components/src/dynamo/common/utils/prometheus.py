@@ -31,6 +31,7 @@ def register_engine_metrics_callback(
     metric_prefix_filters: Optional[list[str]] = None,
     exclude_prefixes: Optional[list[str]] = None,
     add_prefix: Optional[str] = None,
+    inject_labels: Optional[dict[str, str]] = None,
 ) -> None:
     """
     Register a callback to expose engine Prometheus metrics via Dynamo's metrics endpoint.
@@ -44,6 +45,9 @@ def register_engine_metrics_callback(
         metric_prefix_filters: List of prefixes to filter metrics (e.g., ["vllm:"], ["vllm:", "lmcache:"], or None for no filtering)
         exclude_prefixes: List of metric name prefixes to exclude (e.g., ["python_", "process_"])
         add_prefix: Prefix to add to remaining metrics (e.g., "trtllm_")
+        inject_labels: Optional dict of labels to inject (e.g. {"dynamo_namespace": "prod"}).
+                      Injected at collection time without modifying source metrics.
+                      Reserved labels (le, quantile) will raise ValueError.
 
     Example:
         from prometheus_client import REGISTRY
@@ -62,6 +66,13 @@ def register_engine_metrics_callback(
             exclude_prefixes=["python_", "process_"],
             add_prefix="trtllm_"
         )
+
+        # Inject labels (aligns with Rust auto-labels)
+        register_engine_metrics_callback(
+            generate_endpoint, REGISTRY,
+            metric_prefix_filters=["vllm:"],
+            inject_labels={"dynamo_namespace": "prod", "model": "llama-3-70b"}
+        )
     """
 
     def get_expfmt() -> str:
@@ -71,6 +82,7 @@ def register_engine_metrics_callback(
             metric_prefix_filters=metric_prefix_filters,
             exclude_prefixes=exclude_prefixes,
             add_prefix=add_prefix,
+            inject_labels=inject_labels,
         )
 
     endpoint.metrics.register_prometheus_expfmt_callback(get_expfmt)
@@ -110,12 +122,13 @@ def get_prometheus_expfmt(
     metric_prefix_filters: Optional[list[str]] = None,
     exclude_prefixes: Optional[list[str]] = None,
     add_prefix: Optional[str] = None,
+    inject_labels: Optional[dict[str, str]] = None,
 ) -> str:
     """
     Get Prometheus metrics from a registry formatted as text using the standard text encoder.
 
     Collects all metrics from the registry and returns them in Prometheus text exposition format.
-    Optionally filters metrics by prefix, excludes certain prefixes, and adds a prefix.
+    Optionally filters metrics by prefix, excludes certain prefixes, adds a prefix, and injects labels.
 
     IMPORTANT: prometheus_client is imported lazily here because it must be imported AFTER
     set_prometheus_multiproc_dir() is called by SGLang's engine initialization. Importing
@@ -130,6 +143,9 @@ def get_prometheus_expfmt(
                              If None, returns all metrics. Supports single string or list of strings. (default: None)
         exclude_prefixes: List of metric name prefixes to exclude (e.g., ["python_", "process_"])
         add_prefix: Prefix to add to remaining metrics (e.g., "trtllm_")
+        inject_labels: Optional dict of labels to inject at collection time.
+                      Example: {"dynamo_namespace": "prod", "model": "llama-3-70b"}
+                      Reserved labels (le, quantile) will raise ValueError.
 
     Returns:
         Formatted metrics text in Prometheus exposition format. Returns empty string on error.
@@ -140,10 +156,27 @@ def get_prometheus_expfmt(
 
         # Filter out python_/process_ metrics and add trtllm_ prefix
         get_prometheus_expfmt(registry, exclude_prefixes=["python_", "process_"], add_prefix="trtllm_")
+
+        # Inject labels (aligns with Rust auto-labels)
+        get_prometheus_expfmt(
+            registry, metric_prefix_filters=["vllm:"],
+            inject_labels={"dynamo_namespace": "prod", "model": "llama-3-70b"}
+        )
     """
-    from prometheus_client import generate_latest
+    from prometheus_client import CollectorRegistry, generate_latest
 
     try:
+        # If label injection requested, wrap registry with custom collector
+        if inject_labels:
+            from dynamo.common.utils.label_injecting_collector import (
+                LabelInjectingCollector,
+            )
+
+            # Create temporary registry with label-injecting collector
+            temp_registry = CollectorRegistry()
+            temp_registry.register(LabelInjectingCollector(registry, inject_labels))
+            registry = temp_registry
+
         # Generate metrics in Prometheus text format
         metrics_text = generate_latest(registry).decode("utf-8")
 

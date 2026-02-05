@@ -296,6 +296,10 @@ def setup_metrics_collection(config: Config, generate_endpoint, logger):
     Solution: Try adding MultiProcessCollector to REGISTRY. If that fails, use
     separate registry for multiprocess collection and register callbacks to both
     registries to ensure all metrics (vllm, lmcache, dynamo_component) are collected.
+
+    Label injection example (aligns Python metrics with Rust auto-labels):
+        register_engine_metrics_callback(..., inject_labels={
+            "dynamo_namespace": namespace, "model": model_name})
     """
     if config.engine_args.disable_log_stats is False:
         if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
