@@ -120,10 +120,10 @@ class EmbeddingsProcessor:
         grid_thw_tensor = torch.tensor(request.image_grid_thw)
 
         mm_item = dict(
-            format="processor_output",
+            format="precomputed_embedding",
             modality="IMAGE",
             image_grid_thw=grid_thw_tensor,
-            precomputed_embeddings=precomputed_embeddings,
+            feature=precomputed_embeddings,
         )
 
         return mm_item
