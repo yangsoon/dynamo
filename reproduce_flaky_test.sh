@@ -1,48 +1,82 @@
 #!/bin/bash
-# Stress test for router e2e tests
-# Runs tests N times with fresh container per iteration
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Usage:
-#   ./reproduce_flaky_test.sh -p <parallelism> [-s start] [-e end]
+# Router E2E flaky reproducer (Docker-per-iteration).
 #
-# Examples:
-#   ./reproduce_flaky_test.sh -p serial              # iterations 1-100, serial
-#   ./reproduce_flaky_test.sh -p serial -e 50        # iterations 1-50, serial
-#   ./reproduce_flaky_test.sh -p 4                   # iterations 1-100, -n 4
-#   ./reproduce_flaky_test.sh -p 4 -s 25 -e 100      # iterations 25-100, -n 4 (resume)
-#   ./reproduce_flaky_test.sh -p 16 -s 1 -e 50       # iterations 1-50, -n 16
+# - Runs pytest in a fresh container per iteration.
+# - Writes:
+#   - `logs/<serial|nN>_<set>/runNNN/pytest.log` (pytest console output)
+#   - `logs/<serial|nN>_<set>/runNNN/.exit_code` (exit code for that run)
+#   - `logs/<serial|nN>_<set>/runNNN/test_*/...` (per-test logs from ManagedProcess)
+#
+# Chunking mode (recommended for 50+ runs):
+#   - Pass `--chunk-size 5` and the script will fork children (each child runs one chunk),
+#     wait for them all, then regenerate `summary.txt`/`results.txt` once at the end.
+#
+# SIGHUP behavior:
+#   - Kills all forked children (and any active docker container in this process),
+#     then `chown -R` the log directory so you can delete/inspect logs immediately.
 
 # Don't use set -e - we want to continue on test failures
 
 usage() {
-    echo "Usage: $0 -p <parallelism> [-s start] [-e end]"
+    echo "Usage: $0 -p <parallelism> [-t set] [-s start] [-e end] [--chunk-size N]"
     echo ""
     echo "Required:"
     echo "  -p, --parallelism   'serial' or a number (e.g., 1, 4, 16, 32)"
     echo ""
     echo "Optional:"
+    echo "  -t, --set           Set name for organizing multiple runs (e.g., A, run2, test)"
+    echo "                      Creates logs/n4_A/, logs/serial_run2/, etc."
     echo "  -s, --start         Start iteration (default: 1)"
     echo "  -e, --end           End iteration (default: 100)"
+    echo "      --chunk-size    Run in forked chunk mode (e.g., 5 => 1-5, 6-10, ...)"
+    echo "      --chunk-parallel Max number of concurrent chunks (default: unlimited)"
+    echo "      --no-regenerate Internal: child mode (skip summary regeneration)"
     echo "  -h, --help          Show this help"
     echo ""
     echo "Examples:"
-    echo "  $0 -p serial              # iterations 1-100, serial"
-    echo "  $0 -p 4                   # iterations 1-100, -n 4"
-    echo "  $0 -p 4 -s 25             # iterations 25-100, -n 4 (resume)"
-    echo "  $0 -p 16 -s 1 -e 50       # iterations 1-50, -n 16"
+    echo "  $0 -p serial              # logs/serial/"
+    echo "  $0 -p serial -t A         # logs/serial_A/"
+    echo "  $0 -p 4                   # logs/n4/"
+    echo "  $0 -p 4 -t run2           # logs/n4_run2/"
+    echo "  $0 -p 4 -s 25             # resume from iteration 25"
+    echo ""
+    echo "Chunking (forks + waits, then regenerates once):"
+    echo "  $0 -p serial -t fix8 -s 1 -e 50 --chunk-size 5"
     exit 1
 }
 
 # Default values
 PARALLELISM=""
+SET_NAME=""
 START=1
 END=100
+IMAGE="dynamo:latest-dev"
+DOCKER_GPU_ARGS=()
+CHUNK_SIZE=""
+CHUNK_PARALLEL=0
+NO_REGENERATE=0
+CHILD_PIDS=()
+
+# Optional: expose GPU to the container (useful on GPU nodes).
+# Example:
+#   export DYNAMO_DOCKER_GPU_ARGS="--gpus all"
+if [ -n "${DYNAMO_DOCKER_GPU_ARGS:-}" ]; then
+    # shellcheck disable=SC2206
+    DOCKER_GPU_ARGS=(${DYNAMO_DOCKER_GPU_ARGS})
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         -p|--parallelism)
             PARALLELISM="$2"
+            shift 2
+            ;;
+        -t|--set)
+            SET_NAME="$2"
             shift 2
             ;;
         -s|--start)
@@ -52,6 +86,22 @@ while [[ $# -gt 0 ]]; do
         -e|--end)
             END="$2"
             shift 2
+            ;;
+        -i|--image)
+            IMAGE="$2"
+            shift 2
+            ;;
+        --chunk-size)
+            CHUNK_SIZE="$2"
+            shift 2
+            ;;
+        --chunk-parallel)
+            CHUNK_PARALLEL="$2"
+            shift 2
+            ;;
+        --no-regenerate)
+            NO_REGENERATE=1
+            shift 1
             ;;
         -h|--help)
             usage
@@ -86,6 +136,16 @@ if [ "$START" -gt "$END" ]; then
     exit 1
 fi
 
+if [ -n "$CHUNK_SIZE" ] && ! [[ "$CHUNK_SIZE" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --chunk-size must be a number"
+    exit 1
+fi
+
+if ! [[ "$CHUNK_PARALLEL" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --chunk-parallel must be a number"
+    exit 1
+fi
+
 # Get HF_TOKEN
 if [ -z "$HF_TOKEN" ] && [ -f ~/.cache/huggingface/token ]; then
     export HF_TOKEN=$(cat ~/.cache/huggingface/token)
@@ -96,23 +156,177 @@ if [ -z "$HF_TOKEN" ]; then
     exit 1
 fi
 
+# Ensure docker inherits HF_TOKEN without echoing it in xtrace output.
+export HF_TOKEN
+
 # Determine log directory and pytest args
 if [ "$PARALLELISM" = "serial" ]; then
-    LOG_DIR="logs/serial"
+    BASE_DIR="serial"
     PYTEST_ARGS=""
     LABEL="serial"
 else
-    LOG_DIR="logs/n${PARALLELISM}"
+    BASE_DIR="n${PARALLELISM}"
     PYTEST_ARGS="-n ${PARALLELISM}"
     LABEL="-n ${PARALLELISM}"
+fi
+
+# Add set name suffix if provided
+if [ -n "$SET_NAME" ]; then
+    LOG_DIR="logs/${BASE_DIR}_${SET_NAME}"
+    LABEL="$LABEL (set: $SET_NAME)"
+else
+    LOG_DIR="logs/${BASE_DIR}"
 fi
 
 # Create log directory
 mkdir -p "$LOG_DIR"
 
-# Only clear logs if starting from 1
-if [ "$START" -eq 1 ]; then
-    rm -f "$LOG_DIR"/iter_*.log "$LOG_DIR"/results.txt "$LOG_DIR"/summary.txt
+# Kill any forked children and active docker container (if any).
+kill_children() {
+    if [ "${#CHILD_PIDS[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill "$pid" >/dev/null 2>&1 || true
+    done
+
+    # Give children a moment to exit, then force kill.
+    sleep 1
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill -9 "$pid" >/dev/null 2>&1 || true
+    done
+}
+
+# SIGHUP handler:
+# - kill all forked children
+# - kill our active docker container (if any)
+# - chown -R log dir (so rm works immediately)
+fix_ownership() {
+    echo ""
+    echo ">>> SIGHUP received: killing children + fixing ownership of $LOG_DIR"
+    kill_children
+    # Also kill any containers spawned by children (chunked mode).
+    container_prefix="router_${SET_NAME:-${BASE_DIR}}_run"
+    docker ps --format "{{.Names}}" | awk -v p="$container_prefix" 'index($0, p) == 1 {print}' | xargs -r docker kill 2>/dev/null || true
+    if [ -n "${CONTAINER_NAME:-}" ]; then
+        docker kill "$CONTAINER_NAME" 2>/dev/null || true
+    fi
+    sudo chown -R "$(whoami)" "$LOG_DIR" 2>/dev/null || true
+    echo ">>> Ownership fixed"
+}
+trap 'fix_ownership; exit 129' SIGHUP
+
+regenerate_results() {
+    echo ""
+    echo "Regenerating results (with flock)..."
+    (
+        flock -x 200
+
+        > "$LOG_DIR/results.txt"
+        > "$LOG_DIR/summary.txt"
+
+        for run_dir in $(ls -d "$LOG_DIR"/run[0-9][0-9][0-9] 2>/dev/null | sort); do
+            run_name=$(basename "$run_dir")
+            exit_file="$run_dir/.exit_code"
+
+            if [ -f "$exit_file" ]; then
+                exit_code=$(cat "$exit_file")
+                if [ "$exit_code" -eq 0 ]; then
+                    echo "PASSED" >> "$LOG_DIR/results.txt"
+                    echo "$run_name: PASSED" >> "$LOG_DIR/summary.txt"
+                else
+                    echo "FAILED" >> "$LOG_DIR/results.txt"
+                    echo "$run_name: FAILED (exit $exit_code)" >> "$LOG_DIR/summary.txt"
+                fi
+            fi
+        done
+
+    ) 200>"$LOG_DIR/.lock"
+}
+
+print_final_summary() {
+    echo ""
+    echo "================================================================================"
+    echo "FINAL RESULTS"
+    echo "================================================================================"
+    PASSED=$(grep -c "^PASSED$" "$LOG_DIR/results.txt" 2>/dev/null || true)
+    FAILED=$(grep -c "^FAILED$" "$LOG_DIR/results.txt" 2>/dev/null || true)
+    PASSED=${PASSED:-0}
+    FAILED=${FAILED:-0}
+    TOTAL_RESULTS=$((PASSED + FAILED))
+    echo "Range: $START-$END ($TOTAL runs this session)"
+    echo "Total results in directory: $TOTAL_RESULTS"
+    if [ "$TOTAL_RESULTS" -gt 0 ]; then
+        echo "Passed: $PASSED ($(( PASSED * 100 / TOTAL_RESULTS ))%)"
+        echo "Failed: $FAILED ($(( FAILED * 100 / TOTAL_RESULTS ))%)"
+    fi
+    echo ""
+    echo "=== Failed runs ==="
+    grep "FAILED" "$LOG_DIR/summary.txt" 2>/dev/null || echo "None"
+    echo ""
+    echo "=== Error breakdown ==="
+    grep -rh "FAILED tests/" "$LOG_DIR"/run*/pytest.log 2>/dev/null | sort | uniq -c | sort -rn || echo "None"
+    echo ""
+    echo "Completed: $(date)"
+    echo "Logs: $LOG_DIR/"
+    echo "================================================================================"
+}
+
+run_chunked() {
+    echo "================================================================================"
+    echo "Chunked Stress Test: iterations $START-$END, chunk_size=$CHUNK_SIZE, $LABEL"
+    echo "================================================================================"
+    echo "Log directory: $LOG_DIR"
+    echo "Started: $(date)"
+    echo "================================================================================"
+    echo ""
+
+    local script_path="$0"
+    local extra_args=()
+    if [ -n "$SET_NAME" ]; then
+        extra_args+=("-t" "$SET_NAME")
+    fi
+
+    for chunk_start in $(seq "$START" "$CHUNK_SIZE" "$END"); do
+        local chunk_end=$((chunk_start + CHUNK_SIZE - 1))
+        if [ "$chunk_end" -gt "$END" ]; then
+            chunk_end="$END"
+        fi
+
+        echo ">>> Starting chunk ${chunk_start}-${chunk_end}"
+        "$script_path" -p "$PARALLELISM" "${extra_args[@]}" -s "$chunk_start" -e "$chunk_end" -i "$IMAGE" --no-regenerate &
+        echo ">>> Chunk ${chunk_start}-${chunk_end} pid=$!"
+        CHILD_PIDS+=("$!")
+
+        if [ "$CHUNK_PARALLEL" -gt 0 ]; then
+            while [ "$(jobs -pr | wc -l)" -ge "$CHUNK_PARALLEL" ]; do
+                wait -n || true
+            done
+        fi
+    done
+
+    echo ">>> Waiting for ${#CHILD_PIDS[@]} chunk(s) to finish..."
+
+    local rc=0
+    for pid in "${CHILD_PIDS[@]}"; do
+        if ! wait "$pid"; then
+            rc=1
+        fi
+    done
+
+    regenerate_results
+    print_final_summary
+
+    if grep -q "^FAILED$" "$LOG_DIR/results.txt" 2>/dev/null; then
+        return 1
+    fi
+    return "$rc"
+}
+
+if [ -n "$CHUNK_SIZE" ] && [ "$NO_REGENERATE" -eq 0 ]; then
+    run_chunked
+    exit $?
 fi
 
 TOTAL=$((END - START + 1))
@@ -134,60 +348,62 @@ for i in $(seq $START $END); do
 
     # Run test in fresh container with isolated bridge network
     # DYN_TEST_OUTPUT_PATH tells tests (conftest.py logger + ManagedProcess) where to write logs
-    # Include iteration number so each run's test outputs are preserved: logs/n1/run001/test_*/
+    # Log structure: logs/n4/run001/pytest.log (pytest output) + logs/n4/run001/test_*/  (test outputs)
     RUN_NUM=$(printf "%03d" $i)
-    docker run --rm --network bridge --shm-size=10G \
+    RUN_DIR="$LOG_DIR/run${RUN_NUM}"
+    mkdir -p "$RUN_DIR"
+
+    # Container name: router_<set>_run<num> (e.g., router_fix3_run001)
+    CONTAINER_NAME="router_${SET_NAME:-${BASE_DIR}}_run${RUN_NUM}"
+    PYTEST_CMD="pytest tests/router/test_router_e2e_with_mockers.py $PYTEST_ARGS --basetemp=/tmp/pytest --durations=0 --timeout=600"
+    DOCKER_TIMEOUT=660  # 11 min (pytest timeout + buffer for container startup)
+
+    # Random delay (0-5s) to stagger parallel container starts
+    RANDOM_DELAY=$((RANDOM % 6))
+    echo ">>> Waiting ${RANDOM_DELAY}s before starting container..."
+    sleep $RANDOM_DELAY
+
+    # Print the full expanded docker command for debugging.
+    # Keep secrets out of xtrace: pass HF_TOKEN by name only (docker inherits it).
+    set -x
+    timeout $DOCKER_TIMEOUT docker run --rm "${DOCKER_GPU_ARGS[@]}" --name "$CONTAINER_NAME" --network bridge --shm-size=10G \
         --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:65536 \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e DYN_TEST_OUTPUT_PATH="/workspace/$LOG_DIR/run${RUN_NUM}" \
+        -e HF_TOKEN \
+        -e HF_HUB_OFFLINE=1 \
+        -e DYN_TEST_OUTPUT_PATH="/workspace/$RUN_DIR" \
         -v "$(pwd):/workspace" \
         -v "$HOME/.cache:/root/.cache" \
         -w /workspace \
-        dynamo:latest-dev \
-        bash -c "pytest tests/router/test_router_e2e_with_mockers.py $PYTEST_ARGS --basetemp=/tmp/pytest --durations=0 2>&1 | tee $LOG_DIR/iter_${i}.log; exit \${PIPESTATUS[0]}"
+        "$IMAGE" \
+        bash -c "set -x; echo '=== Command: $PYTEST_CMD ===' && echo '=== Started: '\$(date -Iseconds)' ===' && $PYTEST_CMD 2>&1 | tee /workspace/$RUN_DIR/pytest.log; exit \${PIPESTATUS[0]}"
+    set +x
 
     EXIT_CODE=$?
 
-    # Record result
-    if [ $EXIT_CODE -ne 0 ]; then
-        echo "FAILED" >> "$LOG_DIR/results.txt"
-        echo "iter_$i: FAILED (exit $EXIT_CODE)" >> "$LOG_DIR/summary.txt"
-    else
-        echo "PASSED" >> "$LOG_DIR/results.txt"
-        echo "iter_$i: PASSED" >> "$LOG_DIR/summary.txt"
+    # Handle timeout (exit code 124)
+    if [ $EXIT_CODE -eq 124 ]; then
+        echo ">>> TIMEOUT: Run $i exceeded ${DOCKER_TIMEOUT}s - container killed"
+        docker kill "$CONTAINER_NAME" 2>/dev/null || true
     fi
+
+    # Fix ownership of files created by Docker (runs as root)
+    sudo chown -R "$(whoami)" "$RUN_DIR" 2>/dev/null || true
+
+    # Store exit code in run directory (for later regeneration)
+    echo "$EXIT_CODE" > "$RUN_DIR/.exit_code"
 
     # Progress update every 10 iterations
     if [ $((i % 10)) -eq 0 ]; then
-        PASSED=$(grep -c "PASSED" "$LOG_DIR/results.txt" 2>/dev/null || echo 0)
-        FAILED=$(grep -c "FAILED" "$LOG_DIR/results.txt" 2>/dev/null || echo 0)
+        # Quick count from .exit_code files
+        PASSED=$(find "$LOG_DIR" -name ".exit_code" -exec cat {} \; 2>/dev/null | grep -c "^0$" || echo 0)
+        FAILED=$(find "$LOG_DIR" -name ".exit_code" -exec cat {} \; 2>/dev/null | grep -cv "^0$" || echo 0)
         echo ""
         echo ">>> Progress: $i/$END | Passed: $PASSED | Failed: $FAILED"
         echo ""
     fi
 done
 
-# Final summary
-echo ""
-echo "================================================================================"
-echo "FINAL RESULTS"
-echo "================================================================================"
-PASSED=$(grep -c "PASSED" "$LOG_DIR/results.txt" 2>/dev/null || echo 0)
-FAILED=$(grep -c "FAILED" "$LOG_DIR/results.txt" 2>/dev/null || echo 0)
-TOTAL_RESULTS=$((PASSED + FAILED))
-echo "Range: $START-$END ($TOTAL runs this session)"
-echo "Total results: $TOTAL_RESULTS"
-if [ "$TOTAL_RESULTS" -gt 0 ]; then
-    echo "Passed: $PASSED ($(( PASSED * 100 / TOTAL_RESULTS ))%)"
-    echo "Failed: $FAILED ($(( FAILED * 100 / TOTAL_RESULTS ))%)"
+if [ "$NO_REGENERATE" -eq 0 ]; then
+    regenerate_results
+    print_final_summary
 fi
-echo ""
-echo "=== Failed iterations ==="
-grep "FAILED" "$LOG_DIR/summary.txt" 2>/dev/null || echo "None"
-echo ""
-echo "=== Error breakdown ==="
-grep -h "FAILED" "$LOG_DIR"/iter_*.log 2>/dev/null | sort | uniq -c | sort -rn || echo "None"
-echo ""
-echo "Completed: $(date)"
-echo "Logs: $LOG_DIR/"
-echo "================================================================================"
