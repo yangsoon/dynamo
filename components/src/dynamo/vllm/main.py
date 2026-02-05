@@ -28,6 +28,7 @@ from dynamo.llm import (
     fetch_llm,
     register_llm,
 )
+
 # Optional imports for frontend decoding support
 try:
     from dynamo.llm import MediaDecoder, MediaFetcher
@@ -38,7 +39,6 @@ except ImportError:
     MediaFetcher = None
     MEDIA_DECODER_AVAILABLE = False
 
-from dynamo.prometheus_names import labels
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.vllm.multimodal_handlers import (
